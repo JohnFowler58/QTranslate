@@ -4,6 +4,9 @@ import com.github.ahatem.qtranslate.api.core.Logger
 import com.github.ahatem.qtranslate.core.settings.data.HotkeyAction
 import com.github.ahatem.qtranslate.core.settings.data.HotkeyBinding
 import com.github.ahatem.qtranslate.core.settings.data.HotkeyScope
+import com.github.ahatem.qtranslate.ui.swing.shared.clipboard.AwtSystemClipboard
+import com.github.ahatem.qtranslate.ui.swing.shared.clipboard.ClipboardChangeMonitors
+import com.github.ahatem.qtranslate.ui.swing.shared.clipboard.SelectionCapture
 import com.github.kwhat.jnativehook.GlobalScreen
 import com.github.kwhat.jnativehook.NativeHookException
 import com.github.kwhat.jnativehook.keyboard.NativeKeyEvent
@@ -16,12 +19,8 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import java.awt.Point
 import java.awt.Robot
-import java.awt.Toolkit
-import java.awt.datatransfer.DataFlavor
-import java.awt.datatransfer.StringSelection
 import java.awt.event.KeyEvent
 import java.util.concurrent.atomic.AtomicBoolean
-import java.util.UUID
 
 /**
  * Manages global and local hotkey registration.
@@ -64,7 +63,13 @@ class MainGlobalKeyListener(
     private var nativeHookRegistered = false
     private val sequenceListener = CustomSequenceListener()
     private val selectionMouseListener = SelectionMouseListener()
-    private val clipboardLock = AtomicBoolean(false)
+    private val systemClipboard = AwtSystemClipboard()
+    private val selectionCapture = SelectionCapture(
+        clipboard = systemClipboard,
+        changeMonitor = ClipboardChangeMonitors.create(systemClipboard, logger),
+        simulateCopy = { simulateCopy() },
+        logger = logger
+    )
     private val hotkeysEnabled = AtomicBoolean(true)
     // AtomicBoolean.compareAndSet prevents double-initialization if initialize()
     // is called concurrently (e.g. from two rapid lifecycle events).
@@ -239,59 +244,30 @@ class MainGlobalKeyListener(
      * Handles the double-Ctrl sequence for [HotkeyAction.SHOW_MAIN_WINDOW].
      *
      * This cannot be expressed as a single KeyStroke so it uses JNativeHook's
-     * raw key events. It only fires if:
-     * 1. Global hotkeys are enabled
-     * 2. The SHOW_MAIN_WINDOW binding exists AND isEnabled = true
-     *    (Hoyeun's request — user can disable it from the keyboard panel)
+     * raw key events. Tap-pair bookkeeping lives in [DoubleCtrlDetector]; this listener
+     * only supplies events, the enable/binding gate, and the fire action.
      */
     private inner class CustomSequenceListener : NativeKeyListener {
-        private var lastCtrlTime = 0L
-        private val threshold = 400
-
-        /** True once a key other than Ctrl is pressed while Ctrl is held. */
-        private var ctrlWasPartOfCombination = false
-        private var ctrlIsDown = false
+        private val detector = DoubleCtrlDetector()
 
         override fun nativeKeyPressed(e: NativeKeyEvent) {
-            if (e.keyCode == NativeKeyEvent.VC_CONTROL) {
-                ctrlIsDown = true
-                ctrlWasPartOfCombination = false
-            } else if (ctrlIsDown) {
-                ctrlWasPartOfCombination = true
-            }
+            if (e.keyCode == NativeKeyEvent.VC_CONTROL) detector.onControlPressed()
+            else detector.onOtherKeyPressed()
         }
 
         override fun nativeKeyReleased(e: NativeKeyEvent) {
             if (e.keyCode != NativeKeyEvent.VC_CONTROL) return
-            ctrlIsDown = false
 
-            // The Ctrl that ends a shortcut is not a tap. Every hotkey in this application is a
-            // Ctrl combination, so counting those releases meant two shortcuts pressed within the
-            // threshold — Ctrl+Q twice, or Ctrl+Q then Ctrl+D — read as a double-Ctrl and summoned
-            // the main window on top of the popup the user actually asked for.
-            //
-            // The time is cleared as well as ignored, so the release that ends a shortcut cannot
-            // pair with a genuine tap that follows it either.
-            if (ctrlWasPartOfCombination) {
-                ctrlWasPartOfCombination = false
-                lastCtrlTime = 0L
-                return
-            }
-
-            if (!hotkeysEnabled.get()) return
-
-            // Only fire if the binding exists, is enabled, AND the user
-            // has not opted out of the double-Ctrl mechanism specifically.
+            // Only fire if global hotkeys are on and the binding exists, is enabled, AND
+            // the user has not opted out of the double-Ctrl mechanism specifically.
+            // Tracking inside the detector runs regardless, so toggling these cannot
+            // desynchronize its press/release bookkeeping.
             val binding = bindings.find { it.action == HotkeyAction.SHOW_MAIN_WINDOW }
-            if (binding == null || !binding.isEnabled || !binding.isDoubleCtrlEnabled) return
+            val active = hotkeysEnabled.get() &&
+                binding != null && binding.isEnabled && binding.isDoubleCtrlEnabled
+            if (!detector.onControlReleased(System.currentTimeMillis(), active)) return
 
-            val now = System.currentTimeMillis()
-            if (now - lastCtrlTime < threshold) {
-                scope.launch { handleSelectedText(onShowApp) }
-                lastCtrlTime = 0L
-                return
-            }
-            lastCtrlTime = now
+            scope.launch { handleSelectedText(onShowApp) }
         }
     }
 
@@ -347,45 +323,7 @@ class MainGlobalKeyListener(
     }
 
     private suspend fun handleSelectedText(callback: (String) -> Unit) {
-        if (!clipboardLock.compareAndSet(false, true)) return
-        try {
-            val clipboard = Toolkit.getDefaultToolkit().systemClipboard
-            val original  = runCatching { clipboard.getContents(null) }.getOrNull()
-
-            try {
-                // Global hotkey callbacks can arrive while Ctrl/Cmd is still physically held.
-                // Give the originating key sequence time to finish before synthesizing Copy.
-                delay(80)
-
-                var text: String? = null
-                for (backoffMs in longArrayOf(50, 90, 140)) {
-                    val sentinel = "qtranslate-copy-${UUID.randomUUID()}"
-                    runCatching { clipboard.setContents(StringSelection(sentinel), null) }
-
-                    simulateCopy()
-                    delay(backoffMs)
-
-                    val candidate = runCatching {
-                        if (clipboard.isDataFlavorAvailable(DataFlavor.stringFlavor)) {
-                            clipboard.getData(DataFlavor.stringFlavor).toString().trim()
-                        } else {
-                            null
-                        }
-                    }.getOrNull()
-
-                    if (!candidate.isNullOrEmpty() && candidate != sentinel) {
-                        text = candidate
-                        break
-                    }
-                }
-
-                callback(text.orEmpty())
-            } finally {
-                original?.let { runCatching { clipboard.setContents(it, null) } }
-            }
-        } finally {
-            clipboardLock.set(false)
-        }
+        selectionCapture.capture(callback)
     }
 
     private fun simulateCopy() {
