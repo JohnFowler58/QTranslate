@@ -47,6 +47,10 @@ import com.github.ahatem.qtranslate.ui.swing.main.statusbar.NotificationPopover
 import com.github.ahatem.qtranslate.ui.swing.update.UpdateDialog
 import com.github.ahatem.qtranslate.ui.swing.update.UpdateDialogState
 import java.text.SimpleDateFormat
+import com.github.ahatem.qtranslate.ui.swing.main.input.InputRuntimeState
+import com.github.ahatem.qtranslate.ui.swing.main.input.LocalHotkeyRegistration
+import com.github.ahatem.qtranslate.ui.swing.main.input.PasteInjector
+import com.github.ahatem.qtranslate.ui.swing.main.input.QInputPasteInjector
 import com.github.ahatem.qtranslate.ui.swing.main.layout.LayoutManager
 import com.github.ahatem.qtranslate.ui.swing.main.menus.*
 import com.github.ahatem.qtranslate.ui.swing.main.statusbar.StatusBar
@@ -89,7 +93,16 @@ class MainAppFrame(
      */
     private val translateString: (suspend (String, LanguageCode) -> Result<String>)? = null,
     /** The application's own secrets, for the proxy password on the Network settings page. */
-    private val appSecrets: AppSecretStore? = null
+    private val appSecrets: AppSecretStore? = null,
+    /**
+     * True when this process was launched from the Windows startup registration (#226).
+     *
+     * The frame is then constructed exactly as usual — tray, hotkeys, services — but never
+     * made visible, so no window flashes and no taskbar entry appears until the user restores
+     * it through the canonical [showAndFocus] path. The caller guarantees a tray is available
+     * before passing true, so the window always has a recovery path.
+     */
+    private val initiallyHidden: Boolean = false
 ) : JFrame("QTranslate") {
 
     private val appScope = CoroutineScope(SupervisorJob() + Dispatchers.Default + CoroutineName("MainAppFrame"))
@@ -227,12 +240,8 @@ class MainAppFrame(
         availableLanguages = { mainStore.state.value.availableLanguages },
         translateString = translateString,
         appSecrets = appSecrets,
-        pauseGlobalHotkeys  = { globalKeyListener.setHotkeysEnabled(false) },
-        resumeGlobalHotkeys = {
-            globalKeyListener.setHotkeysEnabled(
-                settingsStore.state.value.workingConfiguration.isGlobalHotkeysEnabled
-            )
-        },
+        pauseGlobalHotkeys  = { globalKeyListener.setPaused(true) },
+        resumeGlobalHotkeys = { globalKeyListener.setPaused(false) },
     )
 
     private val mainContentView: MainContentView = MainContentView(
@@ -353,6 +362,67 @@ class MainAppFrame(
         }
     )
 
+    internal var pasteInjector: PasteInjector =
+        QInputPasteInjector(backend = { globalKeyListener.inputBackend() }, logger = logger)
+
+    /** LOCAL-scope hotkeys, installed on the root pane. */
+    private val localHotkeyRegistration = LocalHotkeyRegistration(
+        rootPane = rootPane,
+        bindings = { globalKeyListener.getLocalBindings() },
+        directHandlers = mapOf(
+            // FOCUS_* need layout-aware handling (Compact layout must switch tabs before
+            // focusing), so they go to MainContentView directly.
+            HotkeyAction.FOCUS_INPUT        to { mainContentView.switchToAndFocusInput() },
+            HotkeyAction.FOCUS_OUTPUT       to { mainContentView.switchToAndFocusOutput() },
+            HotkeyAction.FOCUS_EXTRA_OUTPUT to { mainContentView.switchToAndFocusExtraOutput() },
+            // These need something the frame owns: a dialog, the clipboard, or the content view.
+            HotkeyAction.COPY_TRANSLATION to {
+                val text = mainStore.state.value.translatedText
+                if (text.isNotBlank()) {
+                    text.copyToClipboard()
+                    mainStore.dispatch(MainIntent.NotifyTextCopied)
+                }
+            },
+            HotkeyAction.CLEAR_INPUT to {
+                mainStore.dispatch(MainIntent.UpdateInputText(""))
+                mainContentView.switchToAndFocusInput()
+            },
+            HotkeyAction.SWAP_LANGUAGES     to { mainStore.dispatch(MainIntent.SwapLanguages) },
+            HotkeyAction.OPEN_SETTINGS      to { openSettingsDialog() },
+            HotkeyAction.SHOW_HISTORY       to { showHistoryDialog() },
+            HotkeyAction.TRANSLATE_DOCUMENT to { documentTranslationDialog.open() },
+        ),
+        dispatch = { binding -> globalKeyListener.dispatchLocalAction(binding) },
+    )
+
+    /**
+     * Fixed Escape-to-hide binding (#216, first half).
+     *
+     * Hides (`isVisible = false`) rather than disposing or exiting, so tray/global
+     * hotkeys and the next normal show action restore the same window with its
+     * text/state intact. An in-flight translation is cancelled first instead of
+     * hiding, and an open menu/popup keeps Escape for its own dismissal.
+     * See [MainWindowEscapeBinding] for the precedence contract.
+     */
+    private val escapeBinding = MainWindowEscapeBinding(
+        rootPane = rootPane,
+        isTranslationInFlight = { mainStore.state.value.isLoading },
+        isChildHandlingEscape = { isEscapeOwnedByChild() },
+        onCancelTranslation = { mainStore.dispatch(MainIntent.CancelTranslation) },
+        onHide = { isVisible = false },
+    )
+
+    /**
+     * True while a child owns Escape for its own dismissal, so the main-window
+     * hide binding stays out of the way. Covers lightweight popups/menus in this
+     * window (same focused window) and visible owned dialogs.
+     */
+    private fun isEscapeOwnedByChild(): Boolean {
+        if (MenuSelectionManager.defaultManager().selectedPath.isNotEmpty()) return true
+        if (ownedWindows.any { it.isVisible }) return true
+        return false
+    }
+
     /**
      * Closes any floating popup the user has just clicked away from.
      *
@@ -394,11 +464,16 @@ class MainAppFrame(
     )
 
     init {
-        globalKeyListener.updateBindings(
-            settingsStore.state.value.originalConfiguration.hotkeys
-        )
-        globalKeyListener.setSelectionIconEnabled(
-            settingsStore.state.value.originalConfiguration.isSelectionIconEnabled
+        // One explicit runtime input state: bindings and selection follow saved configuration,
+        // the enabled switch and dismissal follow the working copy like their enforcement paths.
+        val storeState = settingsStore.state.value
+        globalKeyListener.updateRuntimeState(
+            InputRuntimeState(
+                bindings = storeState.originalConfiguration.hotkeys,
+                globalHotkeysEnabled = storeState.workingConfiguration.isGlobalHotkeysEnabled,
+                selectionIconEnabled = storeState.originalConfiguration.isSelectionIconEnabled,
+                dismissOnOutsideClickEnabled = storeState.workingConfiguration.closePopupsOnClickOutside
+            )
         )
 
         SwingUtilities.invokeLater {
@@ -427,7 +502,7 @@ class MainAppFrame(
                 )
             }
 
-            iconImages = loadIcons()
+            iconImages = applicationIcons
 
             mainContentView.render(mainStore.state.value, settingsStore.state.value)
             pack()
@@ -445,9 +520,12 @@ class MainAppFrame(
             setupTrayMenu()
             setupGlobalHotkeys()
             setupDropTarget()
+            escapeBinding.register()
 
             observeStateAndEvents()
-            isVisible = true
+            // A login launch stays hidden in the tray: the window is never shown, not shown
+            // and re-hidden, so nothing flashes and no taskbar entry appears (#226).
+            isVisible = !initiallyHidden
 
             // applyOrientation must run AFTER switchLayout's invokeLater has fired.
             // switchLayout() queues an invokeLater internally — if we call
@@ -618,14 +696,13 @@ class MainAppFrame(
                 }
         }
 
-        // Selection translate button — toggling the setting takes effect immediately,
-        // and disabling it hides any button that is currently on screen.
+        // Toggling the setting takes effect immediately, hiding any button on screen; runtime
+        // input state itself is driven by the unified collector below.
         appScope.launch(handler) {
             settingsStore.state
                 .map { it.originalConfiguration.isSelectionIconEnabled }
                 .distinctUntilChanged()
                 .collect { enabled ->
-                    globalKeyListener.setSelectionIconEnabled(enabled)
                     if (!enabled) withContext(Dispatchers.Swing) { selectionTranslateButton.dismiss() }
                 }
         }
@@ -712,17 +789,23 @@ class MainAppFrame(
             }
         }
 
-        // Hotkey binding changes — re-register whenever saved config changes
+        // Runtime input state: one collector over every applied-state input. The boolean
+        // switches are part of the observed key, so a bare enable/disable toggle must reconcile
+        // even when the binding list itself did not change.
         appScope.launch(handler) {
             settingsStore.state
-                .map { it.originalConfiguration.hotkeys }
+                .map { state ->
+                    InputRuntimeState(
+                        bindings = state.originalConfiguration.hotkeys,
+                        globalHotkeysEnabled = state.originalConfiguration.isGlobalHotkeysEnabled,
+                        selectionIconEnabled = state.originalConfiguration.isSelectionIconEnabled,
+                        dismissOnOutsideClickEnabled = state.workingConfiguration.closePopupsOnClickOutside
+                    )
+                }
                 .distinctUntilChanged()
                 .drop(1)
-                .collect { bindings ->
-                    globalKeyListener.updateBindings(bindings)
-                    globalKeyListener.setHotkeysEnabled(
-                        settingsStore.state.value.originalConfiguration.isGlobalHotkeysEnabled
-                    )
+                .collect { runtimeState ->
+                    globalKeyListener.updateRuntimeState(runtimeState)
                     withContext(Dispatchers.Swing) { registerLocalHotkeys() }
                 }
         }
@@ -930,70 +1013,16 @@ class MainAppFrame(
      * whenever bindings change (Dinar's per-action scope request).
      */
     private fun registerLocalHotkeys() {
-        // WHEN_ANCESTOR_OF_FOCUSED_COMPONENT fires whenever any descendant has focus,
-        // which is always the case (text pane, buttons, etc.).
-        // WHEN_FOCUSED would only fire if rootPane itself held focus — which never happens.
-        val inputMap = rootPane.getInputMap(JComponent.WHEN_ANCESTOR_OF_FOCUSED_COMPONENT)
-        inputMap.clear()
-        rootPane.actionMap.clear()
-
-        globalKeyListener.getLocalBindings().forEach { binding ->
-            val keyStroke = binding.toKeyStroke() ?: return@forEach
-            val actionKey = "localHotkey_${binding.action.name}"
-            inputMap.put(keyStroke, actionKey)
-            rootPane.actionMap.put(actionKey, object : AbstractAction() {
-                override fun actionPerformed(e: ActionEvent) {
-                    // FOCUS_* are LOCAL-only and require layout-aware handling (Compact layout must
-                    // switch tabs before focusing). Route them directly to MainContentView rather
-                    // than through globalKeyListener.dispatchAction(), which would do nothing.
-                    when (binding.action) {
-                        HotkeyAction.FOCUS_INPUT        -> mainContentView.switchToAndFocusInput()
-                        HotkeyAction.FOCUS_OUTPUT       -> mainContentView.switchToAndFocusOutput()
-                        HotkeyAction.FOCUS_EXTRA_OUTPUT -> mainContentView.switchToAndFocusExtraOutput()
-
-                        // Also LOCAL-only, and every one of these needs something the frame
-                        // owns — a dialog, the clipboard, or the content view — so they are
-                        // handled here for the same reason FOCUS_* is.
-                        HotkeyAction.COPY_TRANSLATION -> {
-                            val text = mainStore.state.value.translatedText
-                            if (text.isNotBlank()) {
-                                text.copyToClipboard()
-                                mainStore.dispatch(MainIntent.NotifyTextCopied)
-                            }
-                        }
-                        HotkeyAction.CLEAR_INPUT -> {
-                            mainStore.dispatch(MainIntent.UpdateInputText(""))
-                            mainContentView.switchToAndFocusInput()
-                        }
-                        HotkeyAction.SWAP_LANGUAGES     -> mainStore.dispatch(MainIntent.SwapLanguages)
-                        HotkeyAction.OPEN_SETTINGS      -> openSettingsDialog()
-                        HotkeyAction.SHOW_HISTORY       -> showHistoryDialog()
-                        HotkeyAction.TRANSLATE_DOCUMENT -> documentTranslationDialog.open()
-
-                        else -> globalKeyListener.dispatchAction(binding.action)
-                    }
-                }
-            })
-        }
+        localHotkeyRegistration.register()
     }
 
 
     private fun pasteTextToActiveApp(text: String) {
         appScope.launch {
-            runCatching {
-                delay(150) // let any in-flight UI work settle
-
-                val clipboard = Toolkit.getDefaultToolkit().systemClipboard
-                clipboard.setContents(StringSelection(text), null)
-
-                val robot = Robot()
-                robot.autoDelay = 20
-                robot.keyPress(KeyEvent.VK_CONTROL)
-                robot.keyPress(KeyEvent.VK_V)
-                robot.keyRelease(KeyEvent.VK_V)
-                robot.keyRelease(KeyEvent.VK_CONTROL)
-            }.onFailure {
-                logger.warn("Failed to paste translation: ${it.message}")
+            // No settle delay: neutralization inside the injector waits for contaminating
+            // modifiers deterministically.
+            if (!pasteInjector.injectPaste(text)) {
+                logger.warn("Paste translation was not dispatched")
             }
         }
     }
@@ -1017,7 +1046,15 @@ class MainAppFrame(
         if (SwingUtilities.isEventDispatchThread()) block() else SwingUtilities.invokeLater(block)
     }
 
-    private fun showAndFocus() {
+    /**
+     * Canonical user-facing main-window presentation (#216).
+     *
+     * Every path that intentionally presents the main window for interaction —
+     * the global show hotkey, tray restore, second-instance activation — routes
+     * through here so visibility, restore, and input focus stay consistent.
+     * Focus lands in the input editor; text and state are left untouched.
+     */
+    fun showAndFocus() {
         isVisible = true
         state = NORMAL
         toFront()
@@ -1148,7 +1185,7 @@ class MainAppFrame(
         if (!SystemTray.isSupported()) return
 
         val tray = SystemTray.getSystemTray()
-        val iconsList = loadIcons()
+        val iconsList = applicationIcons
 
         if (iconsList.isEmpty()) {
             logger.error("Failed to load any tray icons")
@@ -1253,6 +1290,7 @@ class MainAppFrame(
             override fun windowDeiconified(e: WindowEvent?) {
                 isVisible = true
                 toFront()
+                mainContentView.requestFocusOnInput()
             }
 
             override fun windowClosed(e: WindowEvent?) {
@@ -1435,8 +1473,8 @@ class MainAppFrame(
         }
     }
 
-    private fun loadIcons(): List<Image> {
-        return listOf(16, 20, 24, 32, 48, 64, 128, 256, 512).mapNotNull { size ->
+    private val applicationIcons: List<Image> by lazy {
+        listOf(16, 20, 24, 32, 48, 64, 128, 256, 512).mapNotNull { size ->
             try {
                 ImageIO.read(javaClass.classLoader.getResourceAsStream("icons/app/icon-$size.png"))
             } catch (e: Exception) {
@@ -1545,11 +1583,7 @@ class MainAppFrame(
     private fun setupGlobalHotkeys() {
         addWindowListener(object : WindowAdapter() {
             override fun windowOpened(e: WindowEvent?) {
-                globalKeyListener.initialize()
-                val config = settingsStore.state.value.workingConfiguration
-                globalKeyListener.setHotkeysEnabled(config.isGlobalHotkeysEnabled)
-                globalKeyListener.setSelectionIconEnabled(config.isSelectionIconEnabled)
-                registerLocalHotkeys()
+                initializeGlobalHotkeys()
             }
 
             override fun windowClosed(e: WindowEvent?) {
@@ -1559,6 +1593,26 @@ class MainAppFrame(
                 exitProcess(0)
             }
         })
+        // Global hotkeys must work even when the frame starts hidden in the tray (#226):
+        // windowOpened only fires once the window is first shown, which a login launch may
+        // never do until the user restores it. Initializing here as well is safe — the
+        // backend guards with an atomic check-and-set and local registration reinstalls.
+        initializeGlobalHotkeys()
+    }
+
+    private fun initializeGlobalHotkeys() {
+        globalKeyListener.initialize()
+        val config = settingsStore.state.value.workingConfiguration
+        val saved = settingsStore.state.value.originalConfiguration
+        globalKeyListener.updateRuntimeState(
+            InputRuntimeState(
+                bindings = saved.hotkeys,
+                globalHotkeysEnabled = config.isGlobalHotkeysEnabled,
+                selectionIconEnabled = saved.isSelectionIconEnabled,
+                dismissOnOutsideClickEnabled = config.closePopupsOnClickOutside
+            )
+        )
+        registerLocalHotkeys()
     }
 
     private fun openUrl(url: String) {

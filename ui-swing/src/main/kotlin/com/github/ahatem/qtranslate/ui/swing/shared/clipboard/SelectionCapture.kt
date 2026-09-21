@@ -14,103 +14,125 @@ import kotlinx.coroutines.withContext
  * Captures the selected text by synthesizing Copy, without leaving any internal content on
  * the user's clipboard.
  *
- * The capture order is serialized capture, key-release settle delay, snapshot taken as close
- * as practical to the copy, sequence mark, Copy, capture, restore, and only then the callback,
- * so clipboard managers never observe a placeholder and the QTranslate action sees the
- * clipboard as the user left it. Keeping the snapshot-to-copy window small matters: a snapshot
- * taken before the settle delay could otherwise overwrite a legitimate clipboard update that
- * landed during the delay.
+ * Trigger release synchronization lives with the caller; this class performs no settle delay
+ * of its own. A snapshot that cannot be acquired aborts before Copy is synthesized, since
+ * overwriting unrestorable clipboard state is worse than capturing nothing. Concurrent
+ * requests are serialized through [mutex].
  *
- * A snapshot that cannot be acquired ([ClipboardSnapshotResult.Failed]) aborts the capture
- * before Copy is synthesized: overwriting clipboard state that cannot be restored is worse
- * than capturing nothing. Likewise an unavailable change monitor fails the capture instead
- * of accepting whatever text happens to be on the clipboard.
- *
- * Restoration is retried a bounded number of times for temporary clipboard-busy failures and
- * runs cancellation-shielded, so cancellation never strands the clipboard in the captured
- * state. The capture itself stays cancellable. Restoration reports success: when the original
- * clipboard cannot be put back, the captured selection is not dispatched, because the
- * restore-before-callback invariant means the action must never observe clipboard state the
- * user did not leave there.
- *
- * Concurrent requests are serialized, so two hotkeys cannot fight over clipboard ownership.
+ * See [CaptureResult] for why a clipboard change can never be attributed to this specific
+ * Copy attempt.
  */
 class SelectionCapture(
     private val clipboard: SystemClipboard,
     private val changeMonitor: ClipboardChangeMonitor,
-    private val simulateCopy: suspend () -> Unit,
+    /**
+     * Runs one Copy attempt. `false` means Copy definitely never went through; the clipboard
+     * change observation below remains the actual completion signal either way.
+     */
+    private val simulateCopy: suspend () -> Boolean,
     private val logger: Logger,
     private val mutex: Mutex = Mutex(),
-    private val preCopyDelayMs: Long = DEFAULT_PRE_COPY_DELAY_MS,
     private val pollIntervalMs: Long = DEFAULT_POLL_INTERVAL_MS,
     private val captureTimeoutMs: Long = DEFAULT_CAPTURE_TIMEOUT_MS,
     private val restoreMaxAttempts: Int = DEFAULT_RESTORE_MAX_ATTEMPTS,
     private val restoreRetryDelayMs: Long = DEFAULT_RESTORE_RETRY_DELAY_MS,
 ) {
 
-    /**
-     * Runs one capture. [callback] receives the copied text, or an empty string when nothing
-     * was captured. The callback only ever carries text whose capture was followed by a
-     * successful restoration; when restoration permanently fails the selection is withheld.
-     */
-    suspend fun capture(callback: (String) -> Unit) {
+    /** Runs one capture and reports the outcome via [callback]. */
+    suspend fun capture(callback: (CaptureResult) -> Unit) {
         mutex.withLock {
-            // Hotkeys can arrive while the triggering keys are still held; give the
-            // originating sequence time to finish before touching the clipboard at all.
-            delay(preCopyDelayMs)
-
             val snapshot = readSnapshot()
             if (snapshot is ClipboardSnapshotResult.Failed) {
                 logger.warn("Clipboard snapshot failed, skipping selection capture: ${snapshot.cause?.message}")
                 currentCoroutineContext().ensureActive()
-                callback("")
+                callback(CaptureResult.Failed(CaptureFailure.SNAPSHOT_FAILED))
                 return
             }
 
             val token = changeMonitor.mark()
             if (token == null) {
-                // No synthetic Copy has happened yet, so there is nothing to restore:
-                // abort without touching the clipboard at all.
+                // Nothing to restore yet: abort without touching the clipboard.
                 logger.warn("Clipboard change monitor unavailable, skipping selection capture")
                 currentCoroutineContext().ensureActive()
-                callback("")
+                callback(CaptureResult.Failed(CaptureFailure.MONITOR_UNAVAILABLE))
                 return
             }
 
-            val text = try {
+            val outcome: CopyOutcome = try {
                 copyAndRead(token)
             } catch (cancelled: CancellationException) {
                 restoreShielded(snapshot)
                 throw cancelled
             } catch (e: Exception) {
                 logger.warn("Selection capture failed: ${e.message}")
-                null
+                restoreShielded(snapshot)
+                currentCoroutineContext().ensureActive()
+                callback(CaptureResult.Failed(CaptureFailure.CAPTURE_ERROR))
+                return
             }
 
-            // Only a restored clipboard may be followed by dispatch. A permanently
-            // unrestorable clipboard fails closed: the selection stays undispatched
-            // rather than leaving recovery to the action.
             val restored = restoreShielded(snapshot)
             currentCoroutineContext().ensureActive()
-            callback(if (restored) text.orEmpty() else "")
+            callback(
+                if (!restored) {
+                    CaptureResult.Failed(CaptureFailure.RESTORE_FAILED)
+                } else {
+                    when (outcome) {
+                        is CopyOutcome.Captured -> CaptureResult.Success(outcome.text)
+                        is CopyOutcome.ConfirmedEmpty -> CaptureResult.NoUsableText
+                        is CopyOutcome.InjectionFailed ->
+                            CaptureResult.Failed(CaptureFailure.COPY_INJECTION_FAILED)
+                        is CopyOutcome.Unconfirmed ->
+                            CaptureResult.Failed(CaptureFailure.COPY_UNCONFIRMED)
+                        is CopyOutcome.ReadFailed ->
+                            CaptureResult.Failed(CaptureFailure.CAPTURE_ERROR)
+                    }
+                }
+            )
         }
     }
 
-    private suspend fun copyAndRead(token: Long): String? {
-        simulateCopy()
+    /** What one Copy-and-observe round produced; see [CaptureResult] for how each maps out. */
+    private sealed interface CopyOutcome {
+        data class Captured(val text: String) : CopyOutcome
+        data object ConfirmedEmpty : CopyOutcome
+        data object InjectionFailed : CopyOutcome
+        data object Unconfirmed : CopyOutcome
+        data class ReadFailed(val cause: Throwable) : CopyOutcome
+    }
+
+    private suspend fun copyAndRead(token: Long): CopyOutcome {
+        if (!simulateCopy()) {
+            // Copy definitely never went through; polling would learn nothing.
+            logger.warn("Copy injection failed; selection capture inconclusive")
+            return CopyOutcome.InjectionFailed
+        }
 
         var waited = 0L
         while (true) {
-            // With delayed rendering the sequence may not advance until the clipboard data
-            // is actually requested, while the source application waits for that request
-            // before rendering. Reading here triggers rendering; the text is still only
-            // accepted once the sequence change below verifies the copy landed. The nudged
-            // read is always discarded: text equality is never used as proof of a copy.
-            readText()
+            // Forces delayed-rendering sources to actually render; the outcome is discarded
+            // since nothing is confirmed changed yet.
+            runCatching { clipboard.readText() }
             if (changeMonitor.hasChangedSince(token)) {
-                return readText()
+                // Only now does a read failure mean the capture failed, not that there was
+                // nothing to read.
+                return when (val read = readConfirmedText()) {
+                    is ClipboardReadOutcome.Text -> CopyOutcome.Captured(read.text)
+                    is ClipboardReadOutcome.Empty -> CopyOutcome.ConfirmedEmpty
+                    is ClipboardReadOutcome.Failed -> {
+                        logger.warn(
+                            "Clipboard read failed after a confirmed change; " +
+                                "selection capture inconclusive: ${read.cause.message}"
+                        )
+                        CopyOutcome.ReadFailed(read.cause)
+                    }
+                }
             }
-            if (waited >= captureTimeoutMs) return null
+            if (waited >= captureTimeoutMs) {
+                // No confirmed change is not proof nothing was selected.
+                logger.debug("No confirmed clipboard change within the capture window")
+                return CopyOutcome.Unconfirmed
+            }
             delay(pollIntervalMs)
             waited += pollIntervalMs
         }
@@ -120,17 +142,26 @@ class SelectionCapture(
         runCatching { clipboard.snapshot() }
             .getOrElse { ClipboardSnapshotResult.Failed(it) }
 
-    private fun readText(): String? =
-        runCatching { clipboard.readText() }.getOrNull()?.trim()?.takeIf { it.isNotEmpty() }
+    /** A clipboard read taken after a confirmed generation change, distinguishing failure from emptiness. */
+    private sealed interface ClipboardReadOutcome {
+        data class Text(val text: String) : ClipboardReadOutcome
+        data object Empty : ClipboardReadOutcome
+        data class Failed(val cause: Throwable) : ClipboardReadOutcome
+    }
+
+    private fun readConfirmedText(): ClipboardReadOutcome =
+        runCatching { clipboard.readText() }.fold(
+            onSuccess = { raw ->
+                val text = raw?.trim()?.takeIf { it.isNotEmpty() }
+                if (text != null) ClipboardReadOutcome.Text(text) else ClipboardReadOutcome.Empty
+            },
+            onFailure = { ClipboardReadOutcome.Failed(it) }
+        )
 
     private suspend fun restoreShielded(state: ClipboardSnapshotResult): Boolean =
         withContext(NonCancellable) { restoreWithRetry(state) }
 
-    /**
-     * Returns true when the original state is back on the clipboard. A null restore of a
-     * [ClipboardSnapshotResult.Failed] state can never happen (the flow aborts before Copy),
-     * so every state reaching here has a defined restoration.
-     */
+    /** Every state reaching here has a defined restoration: capture aborts before Copy on a failed snapshot. */
     private suspend fun restoreWithRetry(state: ClipboardSnapshotResult): Boolean {
         var attempt = 0
         while (true) {
@@ -147,7 +178,6 @@ class SelectionCapture(
     }
 
     private companion object {
-        const val DEFAULT_PRE_COPY_DELAY_MS = 80L
         const val DEFAULT_POLL_INTERVAL_MS = 20L
         const val DEFAULT_CAPTURE_TIMEOUT_MS = 600L
         const val DEFAULT_RESTORE_MAX_ATTEMPTS = 3
