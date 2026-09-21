@@ -191,10 +191,6 @@ clear_history_on_exit = "Előzmények törlése az alkalmazás bezárásakor"
 clear_history_hint = "A mentett fordítások kilépéskor véglegesen törlődnek, amikor ez be van kapcsolva."
 selection_read_aloud = "Felolvasás"
 selection_read_original = "Eredeti szöveg"
-history_group = "Előzmények"
-enable_history = "Fordítási előzmények engedélyezése"
-clear_history_on_exit = "Az alkalmazás bezárásakor törölje a előzményeket"
-clear_history_hint = "Ha ez a beállítás be van kapcsolva, a mentett fordítások a program bezárásakor véglegesen törlődnek."
 
 [settings_appearance]
 language_group = "Nyelv"
