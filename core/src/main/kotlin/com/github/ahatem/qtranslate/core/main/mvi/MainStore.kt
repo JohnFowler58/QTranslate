@@ -160,6 +160,7 @@ class MainStore(
                         _state.update {
                             it.copy(
                                 translatedText = "",
+                                translationFailed = false,
                                 comparisonResults = emptyList(),
                                 extraOutputText = "",
                                 detectedSourceLanguage = null,
@@ -331,16 +332,15 @@ class MainStore(
             // and then auto-hid anyway, which is the worst of both.
             MainIntent.HideQuickTranslate -> {
                 quickTranslateGenerations.incrementAndGet()
-                translateTextUseCase.cancel()
-                clearComparisonState()
-                _state.update {
-                    it.copy(
-                        isQuickTranslateDialogVisible = false,
-                        isQuickTranslateDialogPinned = false,
-                        isLoading = false,
-                        isExtraOutputLoading = false
-                    )
-                }
+                // Quick shares its result with the main window, so closing the popup keeps a
+                // finished translation and its comparisons. Work still running is cancelled, with
+                // ownership invalidated so a late result cannot land afterwards. Comparison rows
+                // are cleared only while the primary or a comparison is unfinished: extra output
+                // alone is published after them and does not make a finished set incomplete.
+                val close = _state.value.quickCloseActions()
+                if (close.cancelWork) translateTextUseCase.cancel()
+                if (close.clearComparisons) clearComparisonState()
+                _state.update { it.afterQuickClose() }
             }
 
             MainIntent.ToggleQuickTranslateDialogPin ->
@@ -616,6 +616,7 @@ class MainStore(
                 it.copy(
                     inputText = intent.selectedText,
                     translatedText = "",
+                    translationFailed = false,
                     isLoading = true,
                     isQuickTranslateDialogPinned = false,
                     isQuickTranslateDialogVisible = true,
@@ -795,6 +796,7 @@ class MainStore(
             it.copy(
                 inputText              = snapshot.inputText,
                 translatedText         = snapshot.translatedText,
+                translationFailed      = false,
                 sourceLanguage         = LanguageCode(snapshot.sourceLanguage),
                 targetLanguage         = LanguageCode(snapshot.targetLanguage),
                 historyIndex           = newIndex,
@@ -825,6 +827,7 @@ class MainStore(
                 it.copy(
                     inputText              = "",
                     translatedText         = "",
+                    translationFailed      = false,
                     extraOutputText        = "",
                     detectedSourceLanguage = null,
                     spellCheckCorrections  = emptyList(),
@@ -837,6 +840,7 @@ class MainStore(
                 it.copy(
                     inputText              = snapshot.inputText,
                     translatedText         = snapshot.translatedText,
+                    translationFailed      = false,
                     sourceLanguage         = LanguageCode(snapshot.sourceLanguage),
                     targetLanguage         = LanguageCode(snapshot.targetLanguage),
                     historyIndex           = newIndex,
@@ -857,6 +861,7 @@ class MainStore(
             it.copy(
                 inputText              = snapshot.inputText,
                 translatedText         = snapshot.translatedText,
+                translationFailed      = false,
                 sourceLanguage         = LanguageCode(snapshot.sourceLanguage),
                 targetLanguage         = LanguageCode(snapshot.targetLanguage),
                 historyIndex           = if (idx >= 0) idx + 1 else it.historyIndex,
