@@ -3,6 +3,7 @@ package com.github.ahatem.qtranslate.core.main.mvi
 import com.github.ahatem.qtranslate.api.language.LanguageCode
 import com.github.ahatem.qtranslate.api.plugin.NotificationType
 import com.github.ahatem.qtranslate.api.plugin.ServiceRole
+import com.github.ahatem.qtranslate.api.spellchecker.Correction
 import com.github.ahatem.qtranslate.core.document.DocumentTranslationException
 import com.github.ahatem.qtranslate.core.document.DocumentTranslationRequest
 import com.github.ahatem.qtranslate.core.document.DocumentTranslationUseCase
@@ -35,6 +36,33 @@ private data class ComparisonConfigKey(
     val translationRules: List<com.github.ahatem.qtranslate.core.settings.data.TranslationRule>,
     val disabledServices: Set<String>
 )
+
+internal data class SpellCheckInput(
+    val text: String,
+    val sourceLanguage: LanguageCode,
+    val detectedSourceLanguage: LanguageCode?,
+    val isEnabled: Boolean,
+) {
+    fun matches(state: MainState, enabled: Boolean): Boolean = this == from(state, enabled)
+
+    companion object {
+        fun from(state: MainState, enabled: Boolean) = SpellCheckInput(
+            state.inputText,
+            state.sourceLanguage,
+            state.detectedSourceLanguage.takeIf { state.sourceLanguage == LanguageCode.AUTO },
+            enabled,
+        )
+    }
+}
+
+internal fun spellCheckInputs(states: Flow<MainState>, enabled: Flow<Boolean>): Flow<SpellCheckInput> =
+    combine(
+        states.map { SpellCheckInput.from(it, false) }.distinctUntilChanged(),
+        enabled.distinctUntilChanged(),
+    ) { input, isEnabled -> input.copy(isEnabled = isEnabled) }.distinctUntilChanged()
+
+internal fun MainState.clearSpellCorrectionsForInputChange(previous: SpellCheckInput?, incoming: SpellCheckInput): MainState =
+    if (previous != null && previous != incoming) copy(spellCheckCorrections = emptyList()) else this
 
 /**
  * MVI store for the main translation screen.
@@ -265,12 +293,14 @@ class MainStore(
     @OptIn(FlowPreview::class)
     private fun observeSpellChecking() {
         scope.launch {
-            combine(
-                state.map { it.inputText }.distinctUntilChanged(),
-                settingsState.map { it.isSpellCheckingEnabled }.distinctUntilChanged()
-            ) { text, isEnabled -> text to isEnabled }
+            var previous: SpellCheckInput? = null
+            spellCheckInputs(state, settingsState.map { it.isSpellCheckingEnabled })
+                .onEach { input ->
+                    _state.update { it.clearSpellCorrectionsForInputChange(previous, input) }
+                    previous = input
+                }
                 .debounce(AppConstants.SPELL_CHECK_DEBOUNCE_MS)
-                .collect { (text, isEnabled) -> handleSpellCheck(text, isEnabled) }
+                .collectLatest(::handleSpellCheck)
         }
     }
 
@@ -296,7 +326,7 @@ class MainStore(
                     intent.text.replace("\n", " ").replace("\r", "").replace("  ", " ").trim()
                 else intent.text
                 clearComparisonState()
-                _state.update { it.copy(inputText = cleaned, detectedSourceLanguage = null) }
+                _state.update { it.copy(inputText = cleaned, detectedSourceLanguage = null, spellCheckCorrections = emptyList()) }
                 // With instant translate enabled, cancel any in-flight translation immediately
                 // so the loading indicator clears and the debounce can queue the next request.
                 // Without this, the collect coroutine in observeInstantTranslation stays
@@ -312,7 +342,7 @@ class MainStore(
             is MainIntent.SelectSourceLanguage ->
                 run {
                     clearComparisonState()
-                    _state.update { it.copy(sourceLanguage = intent.language, detectedSourceLanguage = null) }
+                    _state.update { it.copy(sourceLanguage = intent.language, detectedSourceLanguage = null, spellCheckCorrections = emptyList()) }
                 }
 
             is MainIntent.SelectTargetLanguage ->
@@ -324,7 +354,12 @@ class MainStore(
             is MainIntent.ApplyCorrection ->
                 run {
                     clearComparisonState()
-                    _state.update { it.copy(inputText = it.inputText.replaceFirst(intent.original, intent.suggestion)) }
+                    _state.update { current ->
+                        val replacement = if (intent.correction in current.spellCheckCorrections)
+                            replaceCorrectionAtRange(current.inputText, intent.correction, intent.suggestion)
+                        else null
+                        replacement?.let { current.copy(inputText = it, spellCheckCorrections = emptyList()) } ?: current
+                    }
                 }
 
             // Closing clears the pin. A pin says "keep this one around", not "and every one
@@ -367,7 +402,7 @@ class MainStore(
             is MainIntent.TranslateDocument -> startDocumentTranslation(intent)
             MainIntent.CancelDocumentTranslation -> cancelDocumentTranslation()
             MainIntent.PerformSpellCheck -> scope.launch {
-                handleSpellCheck(_state.value.inputText, isEnabled = true)
+                handleSpellCheck(SpellCheckInput.from(_state.value, true), checkSetting = false)
             }
 
             is MainIntent.Translate -> {
@@ -756,17 +791,23 @@ class MainStore(
         )
     }
 
-    private suspend fun handleSpellCheck(text: String, isEnabled: Boolean) {
-        val corrections = if (isEnabled && text.isNotBlank()) {
+    private suspend fun handleSpellCheck(input: SpellCheckInput, checkSetting: Boolean = true) {
+        val snapshot = _state.value
+        if (!input.matches(snapshot, if (checkSetting) settingsState.value.isSpellCheckingEnabled else true)) return
+        val corrections = if (input.isEnabled && input.text.isNotBlank()) {
             performSpellCheckUseCase(
-                currentState   = _state.value,
-                text           = text,
+                currentState   = snapshot,
+                text           = input.text,
                 onStatusUpdate = ::updateStatusBar
             )
         } else {
             emptyList()
         }
-        _state.update { it.copy(spellCheckCorrections = corrections) }
+        _state.update { current ->
+            if (input.matches(current, if (checkSetting) settingsState.value.isSpellCheckingEnabled else true))
+                current.copy(spellCheckCorrections = corrections)
+            else current
+        }
     }
 
     // -------------------------------------------------------------------------
@@ -933,4 +974,11 @@ class MainStore(
     ) {
         _eventChannel.send(MainEvent.UpdateStatusBar(code, type, isTemporary))
     }
+}
+
+internal fun replaceCorrectionAtRange(text: String, correction: Correction, suggestion: String): String? {
+    if (correction.startIndex < 0 || correction.endIndex > text.length ||
+        correction.startIndex >= correction.endIndex ||
+        text.substring(correction.startIndex, correction.endIndex) != correction.original) return null
+    return text.replaceRange(correction.startIndex, correction.endIndex, suggestion)
 }
