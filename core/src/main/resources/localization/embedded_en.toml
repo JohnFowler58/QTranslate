@@ -54,6 +54,7 @@ comparison_failure = "Translation failed"
 comparison_copy = "Copy"
 comparison_details = "Details"
 comparison_primary = "Primary"
+comparison_change_primary = "Change primary translator"
 comparison_empty = "Ready to compare"
 comparison_empty_subtitle = "Enter text above and choose Translate. Results from %s translation services will appear here."
 
@@ -92,7 +93,6 @@ output_hint = "Translation will appear here…"
 layout_presets = "Layout Presets"
 layout_preset_classic = "Classic"
 layout_preset_side_by_side = "Side By Side"
-layout_preset_compact = "Compact"
 layout_preset_comparison = "Comparison"
 instant_translation = "Instant Translation"
 show_extra_output = "Show Extra Output"
@@ -668,10 +668,6 @@ images_not_found = "No images found for \"%s\"."
 image_search_timeout = "Image search timed out."
 image_search_failed = "Image search failed: %s"
 
-[layout_compact]
-tab_input_tooltip = "Source text (%s)"
-tab_output_tooltip = "Translation (%s)"
-tab_extra_tooltip = "Extra output (%s)"
 # ===================================================================
 # LANGUAGE EDITOR
 # ===================================================================

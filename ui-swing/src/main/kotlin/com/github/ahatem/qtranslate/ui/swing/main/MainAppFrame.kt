@@ -36,7 +36,7 @@ import com.github.ahatem.qtranslate.ui.swing.dictionary.QuickDictionaryStrings
 import com.github.ahatem.qtranslate.ui.swing.imagesearch.ImageSearchConfig
 import com.github.ahatem.qtranslate.ui.swing.imagesearch.ImageSearchDialog
 import com.github.ahatem.qtranslate.ui.swing.imagesearch.ImageSearchDialogState
-import com.github.ahatem.qtranslate.ui.swing.imagesearch.ImageSearchStrings
+import com.github.ahatem.qtranslate.ui.swing.imagesearch.imageSearchStrings
 import com.github.ahatem.qtranslate.ui.swing.document.DocumentTranslationDialog
 import com.github.ahatem.qtranslate.ui.swing.document.DocumentTranslationStrings
 import com.github.ahatem.qtranslate.ui.swing.history.HistoryDialog
@@ -51,6 +51,7 @@ import com.github.ahatem.qtranslate.ui.swing.main.input.InputRuntimeState
 import com.github.ahatem.qtranslate.ui.swing.main.input.LocalHotkeyRegistration
 import com.github.ahatem.qtranslate.ui.swing.main.input.PasteInjector
 import com.github.ahatem.qtranslate.ui.swing.main.input.QInputPasteInjector
+import com.github.ahatem.qtranslate.ui.swing.main.layout.DockRoomPlanner
 import com.github.ahatem.qtranslate.ui.swing.main.layout.LayoutManager
 import com.github.ahatem.qtranslate.ui.swing.main.menus.*
 import com.github.ahatem.qtranslate.ui.swing.main.statusbar.StatusBar
@@ -169,15 +170,6 @@ class MainAppFrame(
         DragOverlay(this) { localizer.getString("main_window.drop_hint") }
     }
 
-    /**
-     * Controls where the floating dictionary popup positions itself on first open.
-     * - `true`  → near the mouse cursor   (global hotkey trigger)
-     * - `false` → adjacent to the owner window (auto-lookup from translation)
-     * Set before dispatching [MainIntent.ShowQuickDictionary]; read in [buildQuickDictionaryDialogState].
-     */
-    @Volatile
-    private var quickDictionaryPositionNearMouse = true
-
     private val quickTranslateDialog by lazy {
         QuickTranslateDialog(
             owner = this,
@@ -264,7 +256,9 @@ class MainAppFrame(
                 else ComponentOrientation.LEFT_TO_RIGHT
             )
             dialog.isVisible = true
-        }
+        },
+        onEnsureLookupDockRoom = { ensureRoomForLookupDock() },
+        onOpenImageSource = { result -> openUrl(result.sourceUrl ?: result.fullUrl) }
     )
 
     private val selectionTranslateButton = SelectionTranslateButton(
@@ -350,7 +344,6 @@ class MainAppFrame(
                 // in place and restarts its countdown — hiding it meant the popup vanished when
                 // the user was asking for more of it, and threw away a pin they had set.
                 val lang = mainStore.state.value.resolvedSourceLanguage
-                quickDictionaryPositionNearMouse = true   // hotkey — position near cursor
                 mainStore.dispatch(MainIntent.ShowQuickDictionary(selectedText, lang))
             }
         },
@@ -391,11 +384,11 @@ class MainAppFrame(
         rootPane = rootPane,
         bindings = { globalKeyListener.getLocalBindings() },
         directHandlers = mapOf(
-            // FOCUS_* need layout-aware handling (Compact layout must switch tabs before
-            // focusing), so they go to MainContentView directly.
-            HotkeyAction.FOCUS_INPUT        to { mainContentView.switchToAndFocusInput() },
-            HotkeyAction.FOCUS_OUTPUT       to { mainContentView.switchToAndFocusOutput() },
-            HotkeyAction.FOCUS_EXTRA_OUTPUT to { mainContentView.switchToAndFocusExtraOutput() },
+            // FOCUS_* depend on which panes the current layout shows, so they go to
+            // MainContentView directly.
+            HotkeyAction.FOCUS_INPUT        to { mainContentView.focusInput() },
+            HotkeyAction.FOCUS_OUTPUT       to { mainContentView.focusOutput() },
+            HotkeyAction.FOCUS_EXTRA_OUTPUT to { mainContentView.focusExtraOutput() },
             // These need something the frame owns: a dialog, the clipboard, or the content view.
             HotkeyAction.COPY_TRANSLATION to {
                 val text = mainStore.state.value.translatedText
@@ -406,7 +399,7 @@ class MainAppFrame(
             },
             HotkeyAction.CLEAR_INPUT to {
                 mainStore.dispatch(MainIntent.UpdateInputText(""))
-                mainContentView.switchToAndFocusInput()
+                mainContentView.focusInput()
             },
             HotkeyAction.SWAP_LANGUAGES     to { mainStore.dispatch(MainIntent.SwapLanguages) },
             HotkeyAction.OPEN_SETTINGS      to { openSettingsDialog() },
@@ -532,8 +525,6 @@ class MainAppFrame(
             restorePosition(config.mainWindowPosition)
 
             // Enforce Input → Output → Extra (→ Input) Tab cycle across all layouts.
-            // In Compact layout the policy also switches tabs so hidden panes become
-            // visible before Swing calls requestFocusInWindow() on them.
             focusTraversalPolicy = TextPaneCycleFocusPolicy(mainContentView)
 
             setupWindowListeners()
@@ -972,10 +963,10 @@ class MainAppFrame(
                 }
         }
 
-        // Persist dictionary panel visibility whenever it changes.
+        // Persist whether the lookup dock is open, which is what the "show dictionary panel" setting remembers.
         appScope.launch(handler) {
             mainStore.state
-                .map { it.isDictionaryPanelVisible }
+                .map { it.isLookupDockOpen }
                 .distinctUntilChanged()
                 .drop(1)
                 .collect { visible ->
@@ -1733,6 +1724,34 @@ class MainAppFrame(
     }
 
     /**
+     * Grows the frame before a main-window lookup opens, if that would help: a resizable frame
+     * that is narrower than the workspace and dock together would comfortably like gets wider,
+     * clamped to its monitor's work area, with its height and position otherwise left alone.
+     *
+     * Left alone entirely while maximized (the dock adapts to whatever width that already gives)
+     * or while the frame already has enough room, so opening the dock a second time never moves
+     * anything.
+     */
+    private fun ensureRoomForLookupDock() {
+        if (!isVisible) return
+        val gc = graphicsConfiguration ?: return
+        val screenInsets = runCatching { toolkit.getScreenInsets(gc) }.getOrDefault(Insets(0, 0, 0, 0))
+        val screenBounds = gc.bounds
+        val workArea = Rectangle(
+            screenBounds.x + screenInsets.left,
+            screenBounds.y + screenInsets.top,
+            screenBounds.width - screenInsets.left - screenInsets.right,
+            screenBounds.height - screenInsets.top - screenInsets.bottom
+        )
+        val isMaximized = (extendedState and Frame.MAXIMIZED_HORIZ) == Frame.MAXIMIZED_HORIZ
+        val chromeWidth = width - contentPane.width
+        val wantedWidth = mainContentView.comfortableWidthWithDock() + chromeWidth
+
+        val plan = DockRoomPlanner.plan(bounds, workArea, wantedWidth, isMaximized) ?: return
+        bounds = plan
+    }
+
+    /**
      * Opens the image popup from a menu, seeded with the input text when it is a single word.
      *
      * The hotkey and the context menu both start from a selection; a menu click has none, so it
@@ -1741,23 +1760,20 @@ class MainAppFrame(
     private fun showImageSearchDialog() {
         val term = mainStore.state.value.inputText.trim()
             .takeIf { it.isNotBlank() && !it.contains(' ') } ?: ""
-        mainStore.dispatch(MainIntent.ShowImageSearch(term, mainStore.state.value.resolvedSourceLanguage))
+        val language = mainStore.state.value.resolvedSourceLanguage
+        // From the main window the pictures dock beside the workspace when there is room; from the
+        // tray there is no window to dock in, so they appear as the popup.
+        if (isVisible) mainContentView.openImages(term, language)
+        else mainStore.dispatch(MainIntent.ShowImageSearch(term, language))
     }
 
     private fun showDictionaryDialog() {
         val initialWord = mainStore.state.value.inputText.trim()
             .takeIf { it.isNotBlank() && !it.contains(' ') } ?: ""
 
-        // Main window visible → toggle the inline panel.
+        // Main window visible → the dock beside the workspace, or the popup if it has no room.
         if (isVisible) {
-            val wasVisible = mainStore.state.value.isDictionaryPanelVisible
-            mainStore.dispatch(MainIntent.ToggleDictionaryPanel)
-            if (!wasVisible) {
-                mainContentView.setDictionarySearchWord(initialWord)
-                if (initialWord.isNotBlank()) {
-                    mainStore.dispatch(MainIntent.LookupWord(initialWord))
-                }
-            }
+            mainContentView.toggleDictionary(initialWord)
         } else {
             dictionaryDialog.setSearchWord(initialWord)
             dictionaryDialog.render(buildDictionaryDialogState())
@@ -1853,23 +1869,7 @@ class MainAppFrame(
                 closeOnClickOutside = config.closePopupsOnClickOutside,
                 transparencyPercentage = config.imageSearchTransparencyPercentage
             ),
-            strings = ImageSearchStrings(
-                title             = localizer.getString("image_search_dialog.title"),
-                hintMessage       = localizer.getString("image_search_dialog.hint_message"),
-                loadingMessage    = localizer.getString("image_search_dialog.loading_message"),
-                notFoundMessage   = localizer.getString(
-                    "image_search_dialog.not_found_message",
-                    mainState.imageSearchTerm
-                ),
-                errorMessage      = localizer.getString("image_search_dialog.error_message"),
-                searchButtonLabel = localizer.getString("image_search_dialog.search_button"),
-                openTooltip       = localizer.getString("image_search_dialog.open_tooltip"),
-                openSourceLabel   = localizer.getString("image_search_dialog.open_source"),
-                backLabel         = localizer.getString("image_search_dialog.back"),
-                pinTooltip        = localizer.getString("common.pin"),
-                unpinTooltip      = localizer.getString("common.unpin"),
-                closeTooltip      = localizer.getString("common.close")
-            ),
+            strings = imageSearchStrings(localizer, mainState.imageSearchTerm),
             onSearch = { term -> mainStore.dispatch(MainIntent.SearchImages(term, language)) },
             onServiceSelected = { serviceId ->
                 settingsStore.dispatch(SettingsIntent.UpdateServiceInActivePreset(serviceType, serviceId))
@@ -1926,7 +1926,9 @@ class MainAppFrame(
                 autoPositionEnabled  = config.isQuickDictionaryAutoPositionEnabled,
                 lastKnownSize        = config.quickDictionaryLastKnownSize,
                 lastKnownPosition    = config.quickDictionaryLastKnownPosition,
-                positionNearMouse    = quickDictionaryPositionNearMouse,
+                // The main window now always docks its own lookups, so this popup is only ever
+                // opened from the global hotkey, which fires with the pointer over the selection.
+                positionNearMouse    = true,
                 idleTimeoutSeconds   = config.quickDictionaryIdleTimeoutSeconds,
                 closeOnClickOutside  = config.closePopupsOnClickOutside,
                 transparencyPercentage = config.quickDictionaryTransparencyPercentage
@@ -2206,8 +2208,7 @@ class MainAppFrame(
  *
  * When Tab/Shift+Tab is pressed inside any of the three text panes (input, output, extra),
  * focus moves directly to the next/previous pane in the cycle — skipping toolbar buttons,
- * scrollbars, and other intermediate components.  For Compact (tabbed) layout the policy
- * also selects the target tab so the pane is visible before Swing calls requestFocusInWindow().
+ * scrollbars, and other intermediate components.
  *
  * When Tab is pressed from any component that is NOT one of the managed text panes the
  * standard [LayoutFocusTraversalPolicy] takes over, preserving normal keyboard navigation
@@ -2225,18 +2226,14 @@ private class TextPaneCycleFocusPolicy(
         val all = panes()
         val idx = all.indexOfFirst { it === aComponent }
         if (idx < 0) return fallback.getComponentAfter(aContainer, aComponent)
-        val nextIdx = (idx + 1) % all.size
-        contentView.ensureCompactTabVisible(nextIdx)
-        return all[nextIdx]
+        return all[(idx + 1) % all.size]
     }
 
     override fun getComponentBefore(aContainer: Container, aComponent: Component): Component {
         val all = panes()
         val idx = all.indexOfFirst { it === aComponent }
         if (idx < 0) return fallback.getComponentBefore(aContainer, aComponent)
-        val prevIdx = (idx - 1 + all.size) % all.size
-        contentView.ensureCompactTabVisible(prevIdx)
-        return all[prevIdx]
+        return all[(idx - 1 + all.size) % all.size]
     }
 
     override fun getFirstComponent(aContainer: Container): Component =

@@ -7,8 +7,11 @@ import com.github.ahatem.qtranslate.app.AppDependencies
 import com.github.ahatem.qtranslate.app.AppUiSetup
 import com.github.ahatem.qtranslate.app.ConsoleLoggerFactory
 import com.github.ahatem.qtranslate.app.buildDependencies
+import com.github.ahatem.qtranslate.api.plugin.ServiceRole
+import com.github.ahatem.qtranslate.core.main.mvi.LookupTool
 import com.github.ahatem.qtranslate.core.main.mvi.MainIntent
 import com.github.ahatem.qtranslate.core.settings.data.Configuration
+import com.github.ahatem.qtranslate.core.settings.data.ServicePreset
 import com.github.ahatem.qtranslate.core.settings.data.SettingsRepository
 import com.github.ahatem.qtranslate.core.settings.data.Size
 import com.github.ahatem.qtranslate.core.settings.mvi.SettingsIntent
@@ -30,7 +33,6 @@ import java.io.File
 import javax.imageio.ImageIO
 import javax.swing.JComponent
 import javax.swing.JSplitPane
-import javax.swing.JTabbedPane
 import javax.swing.JTree
 import javax.swing.RootPaneContainer
 import javax.swing.SwingUtilities
@@ -143,19 +145,33 @@ private class Shots(
         translate(LanguageCode("es"), Scenes.PITCH)
         capture("layout-side-by-side-light")
 
-        start(Scenes.compact(Scenes.LIGHT))
-        translate(LanguageCode("fr"), Scenes.LIBRARY)
-        showOutputTab()
-        capture("layout-compact-light")
-
-        start(Scenes.compact(Scenes.DARK))
+        // Below the breakpoint the same layout stacks its panes.
+        start(Scenes.sideBySide(Scenes.DARK))
+        resizeWindow(Scenes.NARROW_WINDOW)
         translate(LanguageCode("ar"), Scenes.PERISTALSIS)
-        showOutputTab()
-        capture("layout-compact-dark")
+        capture("layout-side-by-side-narrow-dark")
 
-        start(Scenes.comparison(Scenes.DARK))
+        // Classic in a window too narrow for anything but a stack, with a long right-to-left result.
+        start(Scenes.classic(Scenes.DARK))
+        resizeWindow(Scenes.NARROW_WINDOW)
+        translate(LanguageCode("ar"), Scenes.PERISTALSIS)
+        capture("layout-classic-narrow-arabic-dark")
+
+        // Google as Primary, one working comparison and one that cannot be reached, so the failed
+        // secondary shows its compact form.
+        start(comparisonConfig(Scenes.DARK, listOf("MyMemory", "LibreTranslate")))
         translate(LanguageCode("fr"), Scenes.LIBRARY)
-        capture("layout-comparison-empty-dark")
+        capture("layout-comparison-dark")
+
+        start(comparisonConfig(Scenes.DARK, listOf("MyMemory", "LibreTranslate")))
+        translate(LanguageCode("fr"), Scenes.LIBRARY)
+        openDictionary("library")
+        capture("layout-comparison-dock-dark")
+
+        start(Scenes.classic(Scenes.DARK))
+        translate(LanguageCode("fr"), Scenes.LIBRARY)
+        openImages("library")
+        capture("dock-images-dark")
 
         // The hero: input, backward translation and the dictionary all at once. Backward
         // translation rather than Summary or Rewrite — those are AI-only, and without an API key
@@ -208,10 +224,14 @@ private class Shots(
         translate(LanguageCode("en"), Scenes.ARABIC_PERISTALSIS)
         capture("rtl-main")
 
-        start(Scenes.arabic("compact"))
+        start(Scenes.arabic("side_by_side"))
         translate(LanguageCode("en"), Scenes.ARABIC_PERISTALSIS)
-        showOutputTab()
-        capture("rtl-compact")
+        capture("rtl-side-by-side")
+
+        start(Scenes.arabic("side_by_side"))
+        translate(LanguageCode("en"), Scenes.ARABIC_PERISTALSIS)
+        openDictionary("peristalsis")
+        capture("rtl-side-by-side-dock")
     }
 
     // ── quick translate ───────────────────────────────────────────────────────
@@ -353,7 +373,6 @@ private class Shots(
      * which gives it the column width its first show sets up.
      */
     private suspend fun balanceSplits(layoutPresetId: String) {
-        if (layoutPresetId == "compact") return
         onUi {
             val current = frame ?: return@onUi
             val panes = splitsOf(current.rootPane).filterIsInstance<MirroredSplitPane>()
@@ -368,6 +387,20 @@ private class Shots(
                     .lastOrNull()?.setLeadingProportion(0.5)
             }
         }
+    }
+
+    /**
+     * Resizes the running window, as a user dragging its edge would. The saved size cannot do this
+     * for a narrow shot: the window's minimum size is applied on top of it.
+     */
+    private suspend fun resizeWindow(size: Pair<Int, Int>) {
+        onUi {
+            requireFrame().apply {
+                minimumSize = Dimension(0, 0)
+                setSize(windowSize(size).width, windowSize(size).height)
+            }
+        }
+        delay(800)
     }
 
     private fun requireFrame(): MainAppFrame = requireNotNull(frame) { "no frame; call start() first" }
@@ -386,27 +419,37 @@ private class Shots(
     }
 
     private suspend fun openDictionary(word: String) {
-        if (!deps.mainStore.state.value.isDictionaryPanelVisible) {
-            deps.mainStore.dispatch(MainIntent.ToggleDictionaryPanel)
-            delay(600)
-        }
+        deps.mainStore.dispatch(MainIntent.OpenLookupDock(LookupTool.DICTIONARY))
+        delay(600)
         deps.mainStore.dispatch(MainIntent.LookupWord(word))
         // Long enough that the status bar has settled off "Looking up…".
         delay(5_000)
-        // The dictionary opens at whatever the app last remembers; the shot needs the column the
-        // same every time it appears, so pin its split once it has settled.
-        onUi {
-            splitsOf(requireFrame().rootPane).filterIsInstance<MirroredSplitPane>()
-                .filter { it.orientation == JSplitPane.HORIZONTAL_SPLIT }
-                .forEach { it.setLeadingProportion(Scenes.DICTIONARY_SPLIT) }
-        }
-        delay(500)
     }
 
-    /** Compact stacks the panes into tabs; show Output so the shot has a translation in it. */
-    private suspend fun showOutputTab() {
-        onUi { find<JTabbedPane>(requireFrame().rootPane)?.selectedIndex = 1 }
-        delay(700)
+    /** Opens the pictures tab of the lookup dock, as choosing Search Images in a wide window does. */
+    private suspend fun openImages(term: String) {
+        deps.mainStore.dispatch(MainIntent.OpenLookupDock(LookupTool.IMAGES))
+        delay(600)
+        deps.mainStore.dispatch(MainIntent.SearchImages(term))
+        delay(6_000)
+    }
+
+    /**
+     * A Comparison scene with Google as Primary and [secondaries] named after the loaded
+     * translators, so the set is real and the ids are whatever this run's registry composed.
+     */
+    private fun comparisonConfig(theme: String, secondaries: List<String>): Configuration {
+        val translators = deps.mainStore.state.value.getAvailableServicesFor(ServiceRole.TRANSLATOR)
+        fun idOf(name: String) = translators.firstOrNull { it.name.contains(name, ignoreCase = true) }?.id
+        val base = Scenes.comparison(theme)
+        val preset = (base.getActivePreset() ?: ServicePreset.createDefault()).let { active ->
+            active.copy(
+                selectedServices = active.selectedServices +
+                    (ServiceRole.TRANSLATOR to (idOf("Google") ?: active.selectedServices[ServiceRole.TRANSLATOR])),
+                comparisonTranslatorIds = secondaries.mapNotNull(::idOf)
+            )
+        }
+        return base.copy(servicePresets = listOf(preset), activeServicePresetId = preset.id)
     }
 
     /**

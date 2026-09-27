@@ -35,13 +35,6 @@ internal object Scenes {
     const val SCALE_PERCENT = 100 * OUTPUT_SCALE
 
     /**
-     * The share of the width every docked dictionary gets, whatever the window or theme. Fixed
-     * here so the column is identical in every shot the dictionary appears in, and stable across
-     * re-renders.
-     */
-    const val DICTIONARY_SPLIT = 0.65
-
-    /**
      * Shared by every scene. Update checks and the selection icon would reach the network and the
      * desktop for no benefit, and system-wide hotkeys would steal Ctrl+Q from whatever else the
      * machine is doing while a capture runs — clearing the list is not enough, since the config
@@ -64,6 +57,9 @@ internal object Scenes {
      * configured [SCALE_PERCENT] zoom needs.
      */
     val WINDOW = 920 to 520
+
+    /** Narrow enough that Side By Side stacks its Input and Output. */
+    val NARROW_WINDOW = 520 to 520
 
     // ── passages ─────────────────────────────────────────────────────────────
     //
@@ -133,9 +129,6 @@ internal object Scenes {
 
     fun sideBySide(theme: String, size: Pair<Int, Int> = WINDOW): Configuration =
         BASE.copy(themeId = theme, layoutPresetId = "side_by_side", mainWindowSize = windowSize(size))
-
-    fun compact(theme: String, size: Pair<Int, Int> = WINDOW): Configuration =
-        BASE.copy(themeId = theme, layoutPresetId = "compact", mainWindowSize = windowSize(size))
 
     fun comparison(theme: String, size: Pair<Int, Int> = WINDOW): Configuration =
         BASE.copy(themeId = theme, layoutPresetId = "comparison", mainWindowSize = windowSize(size))
